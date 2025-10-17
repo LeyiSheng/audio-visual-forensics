@@ -62,5 +62,11 @@ def load_opts():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--lam", type=float, default=0)
+
+    # -- emotion consistency (optional)
+    parser.add_argument('--use_emotion', action='store_true', help='Enable audio-visual emotion consistency scoring')
+    parser.add_argument('--emotion_weight', type=float, default=0.0, help='Weight for emotion inconsistency term')
+    parser.add_argument('--emotion_visual_model', type=str, default='MahmoudWSegni/swin-tiny-patch4-window7-224-finetuned-face-emotion-v12', help='HF repo id for visual emotion model')
+    parser.add_argument('--emotion_audio_model', type=str, default='audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim', help='HF repo id for audio emotion model')
     args = parser.parse_args()
     return args

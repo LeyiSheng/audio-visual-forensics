@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from loguru import logger
 from tqdm.contrib.logging import logging_redirect_tqdm
+from emotion_module import EmotionModels, compute_emotion_inconsistency
 
 opts = load_opts()
 device = opts.device
@@ -138,7 +139,7 @@ class network(nn.Module):
             cls_emb = self.transformer(vid_emb, aud_emb)
         return cls_emb
 
-def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_model, max_len=50):
+def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_model, max_len=50, emotion: Optional[EmotionModels] = None):
     output_dir = opts.output_dir
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -166,6 +167,7 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
                 #real_result.append(1)
                 #fake_result.append(1)
                 #for k in tqdm(range(time_len - 5 + 1)):
+                emo_accum = [] if (emotion is not None and emotion.ok and opts.emotion_weight > 0) else None
                 for k in tqdm(range(max_seq_len), position=1, leave=False, colour='red',ncols=80):
                     #video_set = torch.permute(video_set, (0, 2, 1, 3, 4))
                     video = video_set[:, :, k:k+5, :, :]
@@ -197,13 +199,34 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
                         score = score.reshape(batch_size, 31)
                         avfeature = avfeature.cpu().numpy()[None, ...]
                         avfeature = pca.transform(avfeature)
+                        # Optional: emotion inconsistency using pretrained models on center frame + audio slice
+                        emo_kl = None
+                        if emotion is not None and emotion.ok and opts.emotion_weight > 0:
+                            try:
+                                # center frame of the 5-frame clip, batch first sample
+                                center_idx = min(t // 2, t - 1)
+                                # original un-moved video_set is on CPU, use it for extracting frame
+                                frame_np = video_set[0, :, k + center_idx, :, :].permute(1, 2, 0).cpu().numpy()
+                                frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+                                # center aligned audio slice (15 offset)
+                                aud_wave = audio_set[0, 15*opts.aud_fact:(15+5)*opts.aud_fact].cpu().numpy()
+                                emo_kl = compute_emotion_inconsistency(emotion, frame_np, aud_wave, sr=opts.sample_rate)
+                            except Exception as _:
+                                emo_kl = None
                         #predict = torch.argmax(score, dim=1)
                         #distribution[0, predict.item()] += 1
                         #real_result[-1] = real_result[-1] * real_distribution[0, predict.item()]
                         #fake_result[-1] = fake_result[-1] * fake_distribution[0, predict.item()]
                         #predict = torch.abs(predict - 15)
                         #predict_set.append(predict.item())
-                        predict_set[k] = score.squeeze(0).cpu().numpy()
+                        predict = score.squeeze(0).cpu().numpy()
+                        if emo_kl is not None and opts.emotion_weight > 0 and emo_accum is not None:
+                            emo_accum.append(emo_kl)
+                        if emo_kl is not None and opts.emotion_weight > 0:
+                            # Increase distribution entropy if emotion is inconsistent by adding penalty to negative log-likelihood proxy
+                            # Here we simply store the base distribution; emotion penalty is added later as a scalar to prob.
+                            pass
+                        predict_set[k] = predict
                         predict_set_avfeature[k] = avfeature
                     #print('--------------------computing score for video-------------------')
                 dist_reg_model.eval()
@@ -250,6 +273,10 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
                     prob_avfeature = torch.sum(prob_avfeature, dim=1)
                     prob_avfeature = torch.mean(prob_avfeature)
                     prob = (opts.lam)*prob_avfeature + prob
+                    # Add global emotion inconsistency penalty averaged over windows (if enabled)
+                    if 'emo_accum' in locals() and emo_accum:
+                        emo_mean = float(np.mean(emo_accum))
+                        prob = prob + opts.emotion_weight * torch.tensor(emo_mean, device=prob.device)
                 #tqdm.write("The score of this video is {} ".format(prob.item()))
                 logger.info("The score of this video is {} ".format(prob.item()))
                 score_list.append(prob.item())
@@ -283,6 +310,16 @@ def main():
     dist_regressive_model.to(device)
     avfeature_regressive_model.load_state_dict(avfeature_reg_model_weight)
     avfeature_regressive_model.to(device)
+    # optional: emotion models
+    emotion = None
+    if getattr(opts, 'use_emotion', False) and opts.emotion_weight > 0:
+        emotion = EmotionModels(
+            visual_model_name=opts.emotion_visual_model,
+            audio_model_name=opts.emotion_audio_model,
+            device=device,
+            local_files_only=True,
+        )
+
     if opts.test_video_path is not None:
         if opts.test_video_path.split('.')[-1] == 'mp4':
             test_video = FakeAVceleb([opts.test_video_path], opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
@@ -291,7 +328,7 @@ def main():
                 test_video_path = file.readlines()
             test_video = FakeAVceleb(test_video_path, opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
     loader_test = DataLoader(test_video, batch_size=opts.bs, num_workers=opts.n_workers, shuffle=False)
-    test2(sync_model, avfeature_sync_model, loader_test, dist_reg_model=dist_regressive_model, avfeature_reg_model=avfeature_regressive_model, max_len=opts.max_len)
+    test2(sync_model, avfeature_sync_model, loader_test, dist_reg_model=dist_regressive_model, avfeature_reg_model=avfeature_regressive_model, max_len=opts.max_len, emotion=emotion)
 
 
 
