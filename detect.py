@@ -17,7 +17,7 @@ from torch.utils.data.sampler import RandomSampler, Sampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from typing import List, Optional, Union
 from audio_process import AudioEncoder
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve, accuracy_score
 import matplotlib.pyplot as plt
 import math
 import h5py
@@ -283,6 +283,7 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
                 pbar.update(1)
             np.save(score_file_path, np.array(score_list))
             logger.info('Finished!')
+    return np.array(score_list)
             
 
 
@@ -296,7 +297,8 @@ def main():
     sync_model = network(vis_enc=vis_enc, aud_enc=aud_enc, transformer=Transformer)
     avfeature_sync_model = network(vis_enc=vis_enc, aud_enc=aud_enc, transformer=avfeature_Transformer)
     #model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    sync_model_weight = torch.load('sync_model.pth', map_location=torch.device('cpu'))
+    # Expect sync_model.pth to be downloaded as per README
+    sync_model_weight = torch.load('sync_model.pth', map_location=device)
     sync_model.load_state_dict(sync_model_weight)
     avfeature_sync_model.load_state_dict(sync_model_weight)
     sync_model.to(device)
@@ -304,8 +306,8 @@ def main():
     #model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     dist_regressive_model = transformer_decoder(input_dim_old=31, input_dim=256, compress_factor=1, num_heads=16, dropout_prob=0.1, max_len=49, layers=2)
     avfeature_regressive_model = transformer_decoder(input_dim_old=31, input_dim=256, compress_factor=1, num_heads=16, dropout_prob=0.1, max_len=49, layers=2)
-    reg_model_weight = torch.load('dist_regressive_model.pth', map_location=torch.device("cpu"))
-    avfeature_reg_model_weight = torch.load('avfeature_regressive_model.pth', map_location=torch.device("cpu"))
+    reg_model_weight = torch.load('dist_regressive_model.pth', map_location=device)
+    avfeature_reg_model_weight = torch.load('avfeature_regressive_model.pth', map_location=device)
     dist_regressive_model.load_state_dict(reg_model_weight)
     dist_regressive_model.to(device)
     avfeature_regressive_model.load_state_dict(avfeature_reg_model_weight)
@@ -320,15 +322,156 @@ def main():
             local_files_only=True,
         )
 
+    labels = None  # binary labels for evaluation
+    label_mode = 'binary'  # 'binary' or 'both_fake_positive'
+    paths_for_dataset = None
     if opts.test_video_path is not None:
-        if opts.test_video_path.split('.')[-1] == 'mp4':
-            test_video = FakeAVceleb([opts.test_video_path], opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
+        if opts.test_video_path.split('.')[-1].lower() == 'mp4':
+            paths_for_dataset = [opts.test_video_path]
+        elif opts.test_video_path.split('.')[-1].lower() == 'csv':
+            # CSV support: expect a column for paths and optionally labels
+            df = pd.read_csv(opts.test_video_path)
+            # guess path column
+            path_cols = [c for c in df.columns if str(c).lower() in ['path','video_path','video','filepath','file','mp4','mp4_path']]
+            if len(path_cols) == 0:
+                # fallback to first column
+                path_col = df.columns[0]
+            else:
+                path_col = path_cols[0]
+            paths_for_dataset = df[path_col].astype(str).tolist()
+            # try dual-label columns for both-fake logic
+            dual_pairs = [
+                ('v_fake','a_fake'),
+                ('video_fake','audio_fake'),
+                ('fake_video','fake_audio'),
+                ('v_label','a_label'),
+            ]
+            found_dual = None
+            lower_cols = {str(c).lower(): c for c in df.columns}
+            for a,b in dual_pairs:
+                if a in lower_cols and b in lower_cols:
+                    found_dual = (lower_cols[a], lower_cols[b])
+                    break
+            if found_dual is not None:
+                va = df[found_dual[0]].astype(float).fillna(0).astype(int)
+                aa = df[found_dual[1]].astype(float).fillna(0).astype(int)
+                labels = ((va==1) & (aa==1)).astype(int).to_numpy()
+                label_mode = 'both_fake_positive'
+            else:
+                # single label columns
+                cand = None
+                for name in ['label','y','target','fake','is_fake','both_fake']:
+                    if name in lower_cols:
+                        cand = lower_cols[name]
+                        break
+                if cand is not None:
+                    ser = df[cand]
+                    # map common string tokens
+                    def map_token(v):
+                        try:
+                            f = float(v)
+                            return 1 if int(f)==1 else 0
+                        except Exception:
+                            s = str(v).strip().lower()
+                            if s in ['1','true','t','yes','y','fake','pos','positive','both','bothfake','both_fake','av','va']:
+                                return 1
+                            if s in ['0','false','f','no','n','real','neg','negative']:
+                                return 0
+                            return None
+                    mapped = ser.map(map_token)
+                    if mapped.notna().all():
+                        labels = mapped.astype(int).to_numpy()
+                # else: leave labels=None
         else:
             with open(opts.test_video_path) as file:
-                test_video_path = file.readlines()
-            test_video = FakeAVceleb(test_video_path, opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
+                raw_lines = [l.strip() for l in file.readlines() if len(l.strip()) > 0]
+            paths_for_dataset = []
+            parsed_labels = []
+            for line in raw_lines:
+                parts = line.split()
+                # Default: whole line is path
+                path = line
+                y = None
+                # Try to parse from the end: support two-label format "<path> <v_fake> <a_fake>"
+                if len(parts) >= 3:
+                    last2 = parts[-2:]
+                    try:
+                        v_fake = int(float(last2[0]))
+                        a_fake = int(float(last2[1]))
+                        if v_fake in (0,1) and a_fake in (0,1):
+                            label_mode = 'both_fake_positive'
+                            y = 1 if (v_fake == 1 and a_fake == 1) else 0
+                            path = ' '.join(parts[:-2])
+                    except Exception:
+                        pass
+                # If not two-label, try single label at end
+                if y is None and len(parts) >= 2:
+                    lab_token = parts[-1]
+                    # Recognize tokens
+                    tok = str(lab_token).lower()
+                    if tok in ['1','0']:
+                        y = int(tok)
+                        path = ' '.join(parts[:-1])
+                    elif tok in ['fake','pos','positive','true']:
+                        y = 1
+                        path = ' '.join(parts[:-1])
+                    elif tok in ['real','neg','negative','false']:
+                        y = 0
+                        path = ' '.join(parts[:-1])
+                    elif tok in ['both','bothfake','av','va','both_fake']:
+                        # mark as positive only when both modalities are fake
+                        label_mode = 'both_fake_positive'
+                        y = 1
+                        path = ' '.join(parts[:-1])
+                paths_for_dataset.append(path)
+                parsed_labels.append(y)
+            # if we got labels for all samples, use them
+            if len(parsed_labels) == len(paths_for_dataset) and len(parsed_labels) > 0 and all(l is not None for l in parsed_labels):
+                labels = np.array(parsed_labels, dtype=int)
+        test_video = FakeAVceleb(paths_for_dataset, opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
     loader_test = DataLoader(test_video, batch_size=opts.bs, num_workers=opts.n_workers, shuffle=False)
-    test2(sync_model, avfeature_sync_model, loader_test, dist_reg_model=dist_regressive_model, avfeature_reg_model=avfeature_regressive_model, max_len=opts.max_len, emotion=emotion)
+    scores = test2(sync_model, avfeature_sync_model, loader_test, dist_reg_model=dist_regressive_model, avfeature_reg_model=avfeature_regressive_model, max_len=opts.max_len, emotion=emotion)
+
+    # If labels are provided, compute AUC and ACC (1=fake, higher score => more fake)
+    if labels is not None and len(labels) == len(scores):
+        output_dir = opts.output_dir
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        logger_path = os.path.join(output_dir, 'output.log')
+        met_path = os.path.join(output_dir, 'metrics.json')
+        logger = get_logger(logger_path)
+        try:
+            auc = float(roc_auc_score(labels, scores))
+        except Exception:
+            auc = None
+        # choose threshold maximizing accuracy over ROC thresholds
+        fpr, tpr, thr = roc_curve(labels, scores)
+        acc_best, thr_best = None, None
+        if thr is not None and len(thr) > 0:
+            accs = []
+            for th in thr:
+                if np.isfinite(th):
+                    pred = (scores >= th).astype(int)
+                    accs.append(accuracy_score(labels, pred))
+                else:
+                    accs.append(-1.0)
+            best_idx = int(np.argmax(accs)) if len(accs) > 0 else 0
+            acc_best = float(accs[best_idx]) if len(accs) > 0 else None
+            thr_best = float(thr[best_idx]) if len(thr) > 0 else None
+        metrics = {
+            'num_samples': int(len(scores)),
+            'auc': auc,
+            'acc_best': acc_best,
+            'thr_best': thr_best,
+            'label_mode': label_mode,
+            'pos_count': int(labels.sum()),
+        }
+        with open(met_path, 'w') as fw:
+            json.dump(metrics, fw, indent=2)
+        if label_mode == 'both_fake_positive':
+            logger.info(f"[both-fake positive] AUC: {auc}, ACC(best): {acc_best} @ thr={thr_best}")
+        else:
+            logger.info(f"AUC: {auc}, ACC(best): {acc_best} @ thr={thr_best}")
 
 
 
