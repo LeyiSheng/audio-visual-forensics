@@ -1,4 +1,5 @@
 import os
+import hashlib
 import pickle
 import threading
 
@@ -119,16 +120,33 @@ class FakeAVceleb(data.Dataset):
         video = self.__load_video__(vid_path_25fps, resize=self.resize)
 
         aud_path = os.path.join(self.data_path, vid_name + '.wav')
-        if not os.path.exists(aud_path):  # -- extract wav from mp4
-            command = (
-                ("ffmpeg -threads 1 -loglevel error -y -i {} "
-                    "-async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {}")
-                .format(vid_path_orig, aud_path))
-            from subprocess import call
-            cmd = command.split(' ')
-            call(cmd)
 
-        audio = load_wav(aud_path).astype('float32')
+        def _cache_wav_path(from_video_path: str) -> str:
+            cache_root = os.environ.get('AVF_CACHE_DIR', os.path.join(os.getcwd(), 'av_cache'))
+            os.makedirs(cache_root, exist_ok=True)
+            key = hashlib.sha1(os.path.abspath(from_video_path).encode('utf-8')).hexdigest()
+            return os.path.join(cache_root, key + '.wav')
+
+        # Ensure we have a readable wav: prefer existing side-by-side, otherwise extract to cache
+        target_wav = aud_path
+        if not os.path.exists(target_wav):
+            cached = _cache_wav_path(vid_path_orig)
+            if not os.path.exists(cached):
+                command = (
+                    ("ffmpeg -threads 1 -loglevel error -y -i {} "
+                        "-async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {}")
+                    .format(vid_path_orig, cached))
+                from subprocess import call
+                try:
+                    call(command.split(' '))
+                except Exception:
+                    pass
+            if os.path.exists(cached):
+                target_wav = cached
+        if not os.path.exists(target_wav):
+            raise FileNotFoundError(f"Failed to find or extract audio. Tried: {aud_path} and cache for {vid_path_orig}. Ensure ffmpeg is installed and writable cache via AVF_CACHE_DIR.")
+
+        audio = load_wav(target_wav).astype('float32')
 
         fps = self.fps  # TODO: get as param?
         aud_fact = int(np.round(self.sample_rate / fps))
