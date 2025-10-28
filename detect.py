@@ -1,4 +1,5 @@
 import torch
+import sys
 from tqdm import tqdm
 import numpy as np
 import torch.nn as nn
@@ -46,6 +47,29 @@ device = torch.device(device)
 with open('pca.pkl', 'rb') as pickle_file:
     pca = pickle.load(pickle_file)
 
+def _infer_label_from_path(p: str) -> Optional[int]:
+    """Infer binary label from path tokens.
+    Returns 1 for fake, 0 for real, or None if unknown.
+    """
+    s = str(p).lower()
+    # Positive (fake) indicators
+    pos_tokens = [
+        'fake', 'deepfake', 'dfdc', 'forged', 'synthesis', 'synth',
+        'manipulated', 'edited', 'swap', 'faceswap', 'reenact', 'ai_fake',
+        'generated', 'gen', 'spoof'
+    ]
+    # Negative (real) indicators
+    neg_tokens = [
+        'real', 'genuine', 'authentic', 'original', 'pristine', 'live'
+    ]
+    pos = any(tok in s for tok in pos_tokens)
+    neg = any(tok in s for tok in neg_tokens)
+    if pos and not neg:
+        return 1
+    if neg and not pos:
+        return 0
+    return None
+
 def get_logger(filename, verbosity=1, name=__name__):
     level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
     formatter = logging.Formatter(
@@ -58,9 +82,10 @@ def get_logger(filename, verbosity=1, name=__name__):
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-    # sh = logging.StreamHandler()
-    # sh.setFormatter(formatter)
-    # logger.addHandler(sh)
+    # Also log to stdout instead of the default stderr
+    sh = logging.StreamHandler(stream=sys.stdout)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
 
     return logger
 
@@ -149,7 +174,7 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
     logger.info('Start testing!')
     score_list = []
     with logging_redirect_tqdm():
-        with tqdm(total=len(loader), position=0, leave=False, colour='green', ncols=150) as pbar:
+        with tqdm(total=len(loader), position=0, leave=False, colour='green', ncols=150, file=sys.stdout) as pbar:
             for nm, aud_vis in enumerate(loader):
                 video_set = aud_vis['video']
                 audio_set = aud_vis['audio']
@@ -168,7 +193,7 @@ def test2(dist_model, avfeature_model, loader, dist_reg_model, avfeature_reg_mod
                 #fake_result.append(1)
                 #for k in tqdm(range(time_len - 5 + 1)):
                 emo_accum = [] if (emotion is not None and emotion.ok and opts.emotion_weight > 0) else None
-                for k in tqdm(range(max_seq_len), position=1, leave=False, colour='red',ncols=80):
+                for k in tqdm(range(max_seq_len), position=1, leave=False, colour='red', ncols=80, file=sys.stdout):
                     #video_set = torch.permute(video_set, (0, 2, 1, 3, 4))
                     video = video_set[:, :, k:k+5, :, :]
                     #video = video / 255.0
@@ -428,6 +453,12 @@ def main():
             # if we got labels for all samples, use them
             if len(parsed_labels) == len(paths_for_dataset) and len(parsed_labels) > 0 and all(l is not None for l in parsed_labels):
                 labels = np.array(parsed_labels, dtype=int)
+        # If labels not provided, try inferring from path tokens
+        if labels is None and paths_for_dataset is not None and len(paths_for_dataset) > 0:
+            inferred = [_infer_label_from_path(p) for p in paths_for_dataset]
+            if all(l is not None for l in inferred):
+                labels = np.array(inferred, dtype=int)
+                label_mode = 'binary'
         test_video = FakeAVceleb(paths_for_dataset, opts.resize, opts.fps, opts.sample_rate, vid_len=opts.vid_len, phase=0, train=False, number_sample=1, lrs2=False, need_shift=False, lrs3=False, kodf=False, lavdf=False, robustness=False, test=True)
     loader_test = DataLoader(test_video, batch_size=opts.bs, num_workers=opts.n_workers, shuffle=False)
     scores = test2(sync_model, avfeature_sync_model, loader_test, dist_reg_model=dist_regressive_model, avfeature_reg_model=avfeature_regressive_model, max_len=opts.max_len, emotion=emotion)
