@@ -108,14 +108,15 @@ class FakeAVceleb(data.Dataset):
             vid_path_25fps = os.path.join(self.data_path, vid_name + '.mp4')
         # -- reencode video to 25 fps
         
-        command = (
-            "ffmpeg -threads 1 -loglevel error -y -i {} -an -r 25 {}".format(
-                vid_path_orig, vid_path_25fps))
+        # Prepare a robust ffmpeg command list (no naive split) for potential re-encode
+        # Note: this step is currently disabled (commented out) to avoid unnecessary work.
+        ffmpeg_reenc_cmd = [
+            "ffmpeg", "-threads", "1", "-loglevel", "error", "-y",
+            "-i", vid_path_orig, "-an", "-r", "25", vid_path_25fps
+        ]
         from subprocess import call
-        
-        cmd = command.split(' ')
         #print('Resampling {} to 25 fps'.format(vid_path_orig))
-        #call(cmd)
+        #call(ffmpeg_reenc_cmd)
 
         video = self.__load_video__(vid_path_25fps, resize=self.resize)
 
@@ -132,13 +133,16 @@ class FakeAVceleb(data.Dataset):
         if not os.path.exists(target_wav):
             cached = _cache_wav_path(vid_path_orig)
             if not os.path.exists(cached):
-                command = (
-                    ("ffmpeg -threads 1 -loglevel error -y -i {} "
-                        "-async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {}")
-                    .format(vid_path_orig, cached))
-                from subprocess import call
+                # Extract mono 16k PCM WAV from the source video using ffmpeg.
+                # Use argument list to safely handle spaces/parentheses in paths.
+                ffmpeg_cmd = [
+                    "ffmpeg", "-threads", "1", "-loglevel", "error", "-y",
+                    "-i", vid_path_orig,
+                    "-async", "1", "-ac", "1", "-vn", "-acodec", "pcm_s16le", "-ar", "16000",
+                    cached
+                ]
                 try:
-                    call(command.split(' '))
+                    call(ffmpeg_cmd)
                 except Exception:
                     pass
             if os.path.exists(cached):
